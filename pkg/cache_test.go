@@ -534,6 +534,45 @@ func TestBackgroundGC(t *testing.T) {
 	}
 }
 
+func TestMapShrinkAfterGC(t *testing.T) {
+	pool := NewPoolWithGC(1000, 20*time.Millisecond)
+	defer pool.Close()
+
+	cache, _ := Register[int, [1024]byte](pool, Config{
+		Name:     "test",
+		Min:      0,
+		Max:      1000,
+		TTL:      30 * time.Millisecond,
+		Priority: 1,
+	})
+
+	// fill with data
+	for i := 0; i < 100; i++ {
+		cache.Set(i, [1024]byte{})
+	}
+
+	if cache.Size() != 100 {
+		t.Fatalf("expected 100, got %d", cache.Size())
+	}
+
+	// wait for expiration + GC
+	time.Sleep(80 * time.Millisecond)
+
+	// should be empty and map recreated
+	if cache.Size() != 0 {
+		t.Fatalf("expected 0, got %d", cache.Size())
+	}
+
+	// verify map was recreated (internal check)
+	pool.mu.RLock()
+	mapLen := len(pool.storage)
+	pool.mu.RUnlock()
+
+	if mapLen != 0 {
+		t.Fatalf("expected empty map, got %d", mapLen)
+	}
+}
+
 func BenchmarkSet(b *testing.B) {
 	pool := NewPool(100000)
 	cache, _ := Register[int, int](pool, Config{

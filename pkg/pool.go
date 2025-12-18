@@ -148,6 +148,11 @@ func (p *Pool) cleanupExpired() int {
 		count++
 	}
 
+	// shrink map if empty to release memory
+	if len(p.storage) == 0 {
+		p.storage = make(map[string]*entry)
+	}
+
 	return count
 }
 
