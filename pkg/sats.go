@@ -1,5 +1,7 @@
 package pkg
 
+import "sync/atomic"
+
 // CacheStats holds metrics for a single cache
 type CacheStats struct {
 	Name      string
@@ -25,79 +27,86 @@ type PoolStats struct {
 
 // Stats returns current pool statistics
 func (p *Pool) Stats() PoolStats {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	used := int(atomic.LoadInt32(&p.size))
+	capacity := int(atomic.LoadInt32(&p.capacity))
+	reserved := int(atomic.LoadInt32(&p.reserved))
 
-	used := p.usedSize()
-
-	stats := PoolStats{
-		Capacity:   p.capacity,
-		Reserved:   p.reserved,
-		Used:       used,
-		Free:       p.capacity - used,
-		CacheCount: len(p.caches),
-		Caches:     make(map[string]CacheStats, len(p.caches)),
-	}
+	p.cachesMu.RLock()
+	cacheCount := len(p.caches)
+	caches := make(map[string]CacheStats, cacheCount)
 
 	for name, info := range p.caches {
-		total := info.hits + info.misses
+		hits := atomic.LoadInt64(&info.hits)
+		misses := atomic.LoadInt64(&info.misses)
+		total := hits + misses
 		var hitRate float64
 		if total > 0 {
-			hitRate = float64(info.hits) / float64(total)
+			hitRate = float64(hits) / float64(total)
 		}
 
-		stats.Caches[name] = CacheStats{
+		caches[name] = CacheStats{
 			Name:      name,
-			Size:      info.size,
+			Size:      int(atomic.LoadInt32(&info.size)),
 			Min:       info.min,
 			Max:       info.max,
 			Priority:  info.priority,
-			Hits:      info.hits,
-			Misses:    info.misses,
-			Evictions: info.evictions,
+			Hits:      hits,
+			Misses:    misses,
+			Evictions: atomic.LoadInt64(&info.evictions),
 			HitRate:   hitRate,
 		}
 	}
+	p.cachesMu.RUnlock()
 
-	return stats
+	return PoolStats{
+		Capacity:   capacity,
+		Reserved:   reserved,
+		Used:       used,
+		Free:       capacity - used,
+		CacheCount: cacheCount,
+		Caches:     caches,
+	}
 }
 
 // Stats returns statistics for this specific cache
 func (c *Cache[K, V]) Stats() CacheStats {
-	c.pool.mu.RLock()
-	defer c.pool.mu.RUnlock()
-
+	c.pool.cachesMu.RLock()
 	info := c.pool.caches[c.name]
+	c.pool.cachesMu.RUnlock()
+
 	if info == nil {
 		return CacheStats{Name: c.name}
 	}
 
-	total := info.hits + info.misses
+	hits := atomic.LoadInt64(&info.hits)
+	misses := atomic.LoadInt64(&info.misses)
+	total := hits + misses
 	var hitRate float64
 	if total > 0 {
-		hitRate = float64(info.hits) / float64(total)
+		hitRate = float64(hits) / float64(total)
 	}
 
 	return CacheStats{
 		Name:      info.name,
-		Size:      info.size,
+		Size:      int(atomic.LoadInt32(&info.size)),
 		Min:       info.min,
 		Max:       info.max,
 		Priority:  info.priority,
-		Hits:      info.hits,
-		Misses:    info.misses,
-		Evictions: info.evictions,
+		Hits:      hits,
+		Misses:    misses,
+		Evictions: atomic.LoadInt64(&info.evictions),
 		HitRate:   hitRate,
 	}
 }
 
 // Size returns current number of entries in this cache
 func (c *Cache[K, V]) Size() int {
-	c.pool.mu.RLock()
-	defer c.pool.mu.RUnlock()
+	c.pool.cachesMu.RLock()
 	info := c.pool.caches[c.name]
+	c.pool.cachesMu.RUnlock()
+
 	if info == nil {
 		return 0
 	}
-	return info.size
+	return int(atomic.LoadInt32(&info.size))
 }

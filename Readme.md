@@ -1,4 +1,4 @@
-# lrucache
+#  pkg
 
 Thread-safe LRU cache pool с поддержкой TTL, приоритетов и общей памяти для Go.
 
@@ -16,7 +16,7 @@ Thread-safe LRU cache pool с поддержкой TTL, приоритетов �
 ## Установка
 
 ```bash
-go get github.com/yourname/lrucache
+go get github.com/yourname/ pkg
 ```
 
 ## Быстрый старт
@@ -25,54 +25,54 @@ go get github.com/yourname/lrucache
 package main
 
 import (
-    "fmt"
-    "time"
-    "lrucache"
+	"fmt"
+	"time"
+	" pkg"
 )
 
 type User struct {
-    ID   int
-    Name string
+	ID   int
+	Name string
 }
 
 func main() {
-    // Создаём пул на 10000 элементов
-    pool := lrucache.NewPool(10000)
+	// Создаём пул на 10000 элементов
+	pool :=  pkg.NewPool(10000)
 
-    // Регистрируем типизированный кеш
-    users := lrucache.MustRegister[int, User](pool, lrucache.Config{
-        Name:     "users",
-        Min:      100,   // минимум 100 слотов гарантировано
-        Max:      5000,  // максимум 5000 слотов
-        TTL:      5 * time.Minute,
-        Priority: 10,    // высокий приоритет
-    })
+	// Регистрируем типизированный кеш
+	users :=  pkg.MustRegister[int, User](pool,  pkg.Config{
+		Name:     "users",
+		Min:      100,   // минимум 100 слотов гарантировано
+		Max:      5000,  // максимум 5000 слотов
+		TTL:      5 * time.Minute,
+		Priority: 10,    // высокий приоритет
+	})
 
-    // Базовые операции
-    users.Set(1, User{ID: 1, Name: "Alice"})
-    
-    if user, ok := users.Get(1); ok {
-        fmt.Printf("Found: %+v\n", user)
-    }
+	// Базовые операции
+	users.Set(1, User{ID: 1, Name: "Alice"})
 
-    // Загрузка с singleflight
-    user, err := users.GetOrLoad(2, func() (User, error) {
-        // загрузка из БД, вызовется только один раз
-        // даже при параллельных запросах
-        return User{ID: 2, Name: "Bob"}, nil
-    })
+	if user, ok := users.Get(1); ok {
+		fmt.Printf("Found: %+v\n", user)
+	}
+
+	// Загрузка с singleflight
+	user, err := users.GetOrLoad(2, func() (User, error) {
+		// загрузка из БД, вызовется только один раз
+		// даже при параллельных запросах
+		return User{ID: 2, Name: "Bob"}, nil
+	})
 }
 ```
 
 ## Конфигурация кеша
 
 ```go
-lrucache.Config{
-    Name:     "users",      // уникальное имя для метрик
-    Min:      100,          // защищённый минимум (не вытесняется другими)
-    Max:      1000,         // максимальный размер
-    TTL:      5 * time.Minute, // время жизни записей
-    Priority: 10,           // приоритет (выше = важнее)
+ pkg.Config{
+Name:     "users",      // уникальное имя для метрик
+Min:      100,          // защищённый минимум (не вытесняется другими)
+Max:      1000,         // максимальный размер
+TTL:      5 * time.Minute, // время жизни записей
+Priority: 10,           // приоритет (выше = важнее)
 }
 ```
 
@@ -100,7 +100,7 @@ Pool: 100 элементов
 
 ```go
 // С автоматической очисткой expired каждые 30 секунд
-pool := lrucache.NewPoolWithGC(10000, 30*time.Second)
+pool :=  pkg.NewPoolWithGC(10000, 30*time.Second)
 defer pool.Close() // важно для корректного завершения
 ```
 
@@ -110,13 +110,13 @@ defer pool.Close() // важно для корректного завершен�
 // Статистика конкретного кеша
 stats := users.Stats()
 fmt.Printf("Size: %d, Hits: %d, Misses: %d, HitRate: %.2f%%\n",
-    stats.Size, stats.Hits, stats.Misses, stats.HitRate*100)
+stats.Size, stats.Hits, stats.Misses, stats.HitRate*100)
 
 // Статистика всего пула
 poolStats := pool.Stats()
 fmt.Printf("Pool: %d/%d used\n", poolStats.Used, poolStats.Capacity)
 for name, cs := range poolStats.Caches {
-    fmt.Printf("  %s: %d items, %.1f%% hit rate\n", name, cs.Size, cs.HitRate*100)
+fmt.Printf("  %s: %d items, %.1f%% hit rate\n", name, cs.Size, cs.HitRate*100)
 }
 ```
 
@@ -126,10 +126,11 @@ for name, cs := range poolStats.Caches {
 
 | Метод | Описание |
 |-------|----------|
-| `NewPool(capacity)` | Создать пул |
-| `NewPoolWithGC(capacity, interval)` | Пул с фоновой очисткой |
+| `NewPool(capacity, ...opts)` | Создать пул (с GC по умолчанию) |
+| `WithGCInterval(duration)` | Опция: интервал GC (default: 1m) |
+| `WithPromoteBuffer(size)` | Опция: размер буфера promote (default: 1024) |
 | `pool.Stats()` | Статистика всех кешей |
-| `pool.Close()` | Остановить GC |
+| `pool.Close()` | Остановить воркеры |
 
 ### Cache[K, V]
 
@@ -139,7 +140,8 @@ for name, cs := range poolStats.Caches {
 | `MustRegister[K, V](pool, config)` | То же, но panic при ошибке |
 | `cache.Get(key)` | Получить значение |
 | `cache.Set(key, value)` | Записать значение |
-| `cache.GetOrLoad(key, loader)` | Получить или загрузить |
+| `cache.GetOrLoad(key, loader)` | Получить или загрузить (singleflight) |
+| `cache.GetOrLoadBatch(batchLoader, cfg)` | Создать batch loader (DataLoader) |
 | `cache.Stats()` | Статистика кеша |
 | `cache.Size()` | Текущий размер |
 | `cache.Name()` | Имя кеша |
@@ -147,40 +149,82 @@ for name, cs := range poolStats.Caches {
 ## Производительность
 
 ```
-BenchmarkSet-4         5133565    230 ns/op    32 B/op    3 allocs/op
-BenchmarkGet-4         6335289    191 ns/op    15 B/op    1 allocs/op
-BenchmarkGetOrLoad-4   5646464    208 ns/op    16 B/op    1 allocs/op
+BenchmarkSet-4              2851964    406 ns/op    32 B/op    3 allocs/op
+BenchmarkGet-4              3391302    381 ns/op    15 B/op    1 allocs/op
+BenchmarkGetParallel-4      9677872    206 ns/op    15 B/op    1 allocs/op  ← lock-free
+BenchmarkSetParallel-4      4323874    337 ns/op    32 B/op    3 allocs/op
 ```
 
-## Thread Safety
+## Singleflight
 
-Все операции потокобезопасны. Используется `sync.Mutex` для защиты общего состояния.
+`GetOrLoad` реализует per-key singleflight — при параллельных запросах одного ключа loader вызовется только один раз. Другие ключи не блокируются.
 
-`GetOrLoad` реализует singleflight — при параллельных запросах одного ключа loader вызовется только один раз.
+```go
+// 10 горутин запрашивают ключ 1 → 1 вызов loader
+// Параллельно 10 горутин запрашивают ключ 2 → ещё 1 вызов loader
+// Итого: 2 вызова, не 20
+```
 
-## Пример: микросервис
+## Batch Loading (DataLoader pattern)
+
+Для оптимизации N+1 запросов — батчинг как в GraphQL DataLoader:
+
+```go
+// Создаём batch loader
+loadUser := cache.GetOrLoadBatch(
+    func(ids []int) (map[int]User, error) {
+        // Один SQL запрос вместо N
+        return db.GetUsersByIDs(ids)
+    },
+     pkg.BatchConfig{
+        MaxWait:  5 * time.Millisecond, // ждём накопления
+        MaxBatch: 100,                   // макс ключей за раз
+    },
+)
+
+// Использование в резолверах
+var wg sync.WaitGroup
+for _, order := range orders {
+    wg.Add(1)
+    go func(userID int) {
+        defer wg.Done()
+        user, err := loadUser(userID)  // накапливаются в batch
+        // ...
+    }(order.UserID)
+}
+wg.Wait()
+// 100 заказов → 1-2 SQL запроса вместо 100
+```
+
+**Как работает:**
+1. Первый запрос запускает таймер (MaxWait)
+2. Последующие запросы накапливаются в буфер
+3. По таймеру или при достижении MaxBatch — отправляется batch
+4. Результаты кешируются и раздаются ожидающим
+
+## Производительность
 
 ```go
 func main() {
-    pool := lrucache.NewPoolWithGC(50000, time.Minute)
-    defer pool.Close()
+pool :=  pkg.NewPoolWithGC(50000, time.Minute)
+defer pool.Close()
 
-    // Горячие данные — высокий приоритет
-    users := lrucache.MustRegister[int64, User](pool, lrucache.Config{
-        Name: "users", Min: 5000, Max: 20000, TTL: 10 * time.Minute, Priority: 10,
-    })
+// Горячие данные — высокий приоритет
+users :=  pkg.MustRegister[int64, User](pool,  pkg.Config{
+Name: "users", Min: 5000, Max: 20000, TTL: 10 * time.Minute, Priority: 10,
+})
 
-    // Сессии — средний приоритет  
-    sessions := lrucache.MustRegister[string, Session](pool, lrucache.Config{
-        Name: "sessions", Min: 2000, Max: 15000, TTL: 30 * time.Minute, Priority: 5,
-    })
+// Сессии — средний приоритет  
+sessions :=  pkg.MustRegister[string, Session](pool,  pkg.Config{
+Name: "sessions", Min: 2000, Max: 15000, TTL: 30 * time.Minute, Priority: 5,
+})
 
-    // Справочники — низкий приоритет, долгий TTL
-    catalogs := lrucache.MustRegister[string, []Product](pool, lrucache.Config{
-        Name: "catalogs", Min: 100, Max: 5000, TTL: time.Hour, Priority: 1,
-    })
+// Справочники — низкий приоритет, долгий TTL
+catalogs :=  pkg.MustRegister[string, []Product](pool,  pkg.Config{
+Name: "catalogs", Min: 100, Max: 5000, TTL: time.Hour, Priority: 1,
+})
 
-    // HTTP handlers используют кеши...
+// HTTP handlers используют кеши...
 }
 ```
 

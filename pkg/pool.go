@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,31 +15,81 @@ var (
 	ErrMaxExceedsAvail = errors.New("max exceeds available capacity: capacity - sum(other min) < max")
 )
 
+const (
+	defaultGCInterval     = time.Minute
+	defaultPromoteBuffer  = 1024
+	defaultPromoteWorkers = 1
+)
+
+// PoolOption configures Pool
+type PoolOption func(*poolConfig)
+
+type poolConfig struct {
+	gcInterval     time.Duration
+	promoteBuffer  int
+	promoteWorkers int
+}
+
+// WithGCInterval sets garbage collection interval
+func WithGCInterval(d time.Duration) PoolOption {
+	return func(c *poolConfig) {
+		c.gcInterval = d
+	}
+}
+
+// WithPromoteBuffer sets promote channel buffer size
+func WithPromoteBuffer(size int) PoolOption {
+	return func(c *poolConfig) {
+		c.promoteBuffer = size
+	}
+}
+
 // Pool manages shared memory for multiple caches
 type Pool struct {
-	mu sync.RWMutex
+	capacity int32 // total capacity limit
+	reserved int32 // sum of all min values
+	size     int32 // current total entries (atomic)
 
-	capacity int // total capacity limit
-	reserved int // sum of all min values
+	// unified storage - lock-free reads
+	storage sync.Map // map[string]*entry
 
-	// unified storage
-	storage map[string]*entry // key format: "cacheName:actualKey"
-	lruList *list.List        // global LRU list
+	// LRU tracking (protected by lruMu)
+	lruMu   sync.Mutex
+	lruList *list.List
 
-	// registered caches
-	caches map[string]*cacheInfo
+	// registered caches (protected by cachesMu)
+	cachesMu sync.RWMutex
+	caches   map[string]*cacheInfo
 
-	// background GC
-	gcStop chan struct{}
-	gcDone chan struct{}
+	// async promote
+	promoteCh chan *entry
+
+	// background workers
+	stop chan struct{}
+	done sync.WaitGroup
 }
 
 type entry struct {
-	key       string // full key with prefix
+	key       string
 	value     any
 	cacheName string
-	expiresAt time.Time
-	element   *list.Element // pointer to LRU list element
+	expiresAt int64         // unix nano for atomic access
+	element   *list.Element // protected by lruMu
+
+	// для отслеживания удаления
+	deleted int32 // atomic: 1 = deleted
+}
+
+func (e *entry) isExpired() bool {
+	return time.Now().UnixNano() > atomic.LoadInt64(&e.expiresAt)
+}
+
+func (e *entry) isDeleted() bool {
+	return atomic.LoadInt32(&e.deleted) == 1
+}
+
+func (e *entry) markDeleted() bool {
+	return atomic.CompareAndSwapInt32(&e.deleted, 0, 1)
 }
 
 type cacheInfo struct {
@@ -48,10 +99,10 @@ type cacheInfo struct {
 	ttl      time.Duration
 	priority int
 
-	// current state
-	size int
+	// current state (atomic)
+	size int32
 
-	// metrics
+	// metrics (atomic)
 	hits      int64
 	misses    int64
 	evictions int64
@@ -83,36 +134,46 @@ func (c Config) validate() error {
 }
 
 // NewPool creates a new cache pool with given capacity
-func NewPool(capacity int) *Pool {
-	return &Pool{
-		capacity: capacity,
-		storage:  make(map[string]*entry),
-		lruList:  list.New(),
-		caches:   make(map[string]*cacheInfo),
+func NewPool(capacity int, opts ...PoolOption) *Pool {
+	cfg := &poolConfig{
+		gcInterval:     defaultGCInterval,
+		promoteBuffer:  defaultPromoteBuffer,
+		promoteWorkers: defaultPromoteWorkers,
 	}
-}
+	for _, opt := range opts {
+		opt(cfg)
+	}
 
-// NewPoolWithGC creates a new cache pool with background garbage collection
-func NewPoolWithGC(capacity int, gcInterval time.Duration) *Pool {
-	p := NewPool(capacity)
-	p.gcStop = make(chan struct{})
-	p.gcDone = make(chan struct{})
+	p := &Pool{
+		capacity:  int32(capacity),
+		lruList:   list.New(),
+		caches:    make(map[string]*cacheInfo),
+		promoteCh: make(chan *entry, cfg.promoteBuffer),
+		stop:      make(chan struct{}),
+	}
 
-	go p.runGC(gcInterval)
+	// start GC worker
+	p.done.Add(1)
+	go p.gcWorker(cfg.gcInterval)
+
+	// start promote workers
+	for i := 0; i < cfg.promoteWorkers; i++ {
+		p.done.Add(1)
+		go p.promoteWorker()
+	}
 
 	return p
 }
 
-// runGC periodically cleans up expired entries
-func (p *Pool) runGC(interval time.Duration) {
-	defer close(p.gcDone)
-
+// gcWorker periodically cleans up expired entries
+func (p *Pool) gcWorker(interval time.Duration) {
+	defer p.done.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-p.gcStop:
+		case <-p.stop:
 			return
 		case <-ticker.C:
 			p.cleanupExpired()
@@ -120,48 +181,64 @@ func (p *Pool) runGC(interval time.Duration) {
 	}
 }
 
+// promoteWorker processes LRU promotions
+func (p *Pool) promoteWorker() {
+	defer p.done.Done()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case ent := <-p.promoteCh:
+			if ent.isDeleted() || ent.isExpired() {
+				continue
+			}
+			p.lruMu.Lock()
+			if ent.element != nil && !ent.isDeleted() {
+				p.lruList.MoveToFront(ent.element)
+			}
+			p.lruMu.Unlock()
+		}
+	}
+}
+
 // cleanupExpired removes all expired entries
 func (p *Pool) cleanupExpired() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	count := 0
-	now := time.Now()
 
-	// collect expired entries first to avoid modifying list while iterating
+	p.lruMu.Lock()
 	var toRemove []*entry
 	for el := p.lruList.Back(); el != nil; el = el.Prev() {
 		ent, ok := el.Value.(*entry)
 		if !ok {
 			continue
 		}
-		if now.After(ent.expiresAt) {
+		if ent.isExpired() {
 			toRemove = append(toRemove, ent)
 		}
 	}
+	p.lruMu.Unlock()
 
 	for _, ent := range toRemove {
-		p.removeEntry(ent)
-		if info, ok := p.caches[ent.cacheName]; ok {
-			info.evictions++
+		if ent.markDeleted() {
+			p.removeEntry(ent)
+			count++
 		}
-		count++
 	}
 
-	// shrink map if empty to release memory
-	if len(p.storage) == 0 {
-		p.storage = make(map[string]*entry)
+	// shrink if empty
+	if atomic.LoadInt32(&p.size) == 0 {
+		p.lruMu.Lock()
+		p.lruList = list.New()
+		p.lruMu.Unlock()
 	}
 
 	return count
 }
 
-// Close stops background GC and releases resources
+// Close stops background workers and releases resources
 func (p *Pool) Close() {
-	if p.gcStop != nil {
-		close(p.gcStop)
-		<-p.gcDone
-	}
+	close(p.stop)
+	p.done.Wait()
 }
 
 // validateRegistration checks if new cache can be registered
@@ -175,14 +252,13 @@ func (p *Pool) validateRegistration(cfg Config) error {
 	}
 
 	// sum(min) <= capacity
-	newReserved := p.reserved + cfg.Min
-	if newReserved > p.capacity {
+	newReserved := int(p.reserved) + cfg.Min
+	if newReserved > int(p.capacity) {
 		return ErrPoolCapacity
 	}
 
 	// capacity - sum(other min) >= max
-	// i.e., this cache's max shouldn't exceed what's available after reserving others' mins
-	availableForThisCache := p.capacity - p.reserved // other caches' reserved
+	availableForThisCache := int(p.capacity) - int(p.reserved)
 	if cfg.Max > availableForThisCache {
 		return ErrMaxExceedsAvail
 	}
@@ -190,10 +266,10 @@ func (p *Pool) validateRegistration(cfg Config) error {
 	return nil
 }
 
-// registerCache adds cache metadata to pool (called by Register)
+// registerCache adds cache metadata to pool
 func (p *Pool) registerCache(cfg Config) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.cachesMu.Lock()
+	defer p.cachesMu.Unlock()
 
 	if err := p.validateRegistration(cfg); err != nil {
 		return err
@@ -206,15 +282,209 @@ func (p *Pool) registerCache(cfg Config) error {
 		ttl:      cfg.TTL,
 		priority: cfg.Priority,
 	}
-	p.reserved += cfg.Min
+	atomic.AddInt32(&p.reserved, int32(cfg.Min))
 
 	return nil
 }
 
+// get retrieves entry without locking (lock-free)
+func (p *Pool) get(fullKey string) (*entry, bool) {
+	raw, exists := p.storage.Load(fullKey)
+	if !exists {
+		return nil, false
+	}
+
+	ent := raw.(*entry)
+	if ent.isDeleted() || ent.isExpired() {
+		return nil, false
+	}
+
+	return ent, true
+}
+
+// promote schedules LRU promotion (non-blocking)
+func (p *Pool) promote(ent *entry) {
+	select {
+	case p.promoteCh <- ent:
+	default:
+		// channel full, skip promotion
+	}
+}
+
+// setInternal adds or updates entry
+func (p *Pool) setInternal(cacheName string, key any, value any, ttl time.Duration) {
+	fullKey := makeKey(cacheName, key)
+
+	p.cachesMu.RLock()
+	info := p.caches[cacheName]
+	p.cachesMu.RUnlock()
+
+	if info == nil {
+		return
+	}
+
+	expiresAt := time.Now().Add(ttl).UnixNano()
+
+	// check if key already exists
+	if raw, exists := p.storage.Load(fullKey); exists {
+		ent := raw.(*entry)
+		if !ent.isDeleted() {
+			// update existing
+			ent.value = value
+			atomic.StoreInt64(&ent.expiresAt, expiresAt)
+			p.promote(ent)
+			return
+		}
+	}
+
+	// need to add new entry
+	cacheSize := atomic.LoadInt32(&info.size)
+
+	// check if this cache is at max - evict until below max
+	if int(cacheSize) >= info.max {
+		for int(atomic.LoadInt32(&info.size)) >= info.max {
+			if !p.evictFromCache(cacheName) {
+				break // no more entries to evict from this cache
+			}
+		}
+	}
+
+	// check if pool is full - evict until below capacity
+	// Используем цикл для гарантии освобождения места
+	for atomic.LoadInt32(&p.size) >= p.capacity {
+		if !p.evictOne(cacheName) {
+			break // no more entries to evict
+		}
+	}
+
+	// create new entry
+	ent := &entry{
+		key:       fullKey,
+		value:     value,
+		cacheName: cacheName,
+		expiresAt: expiresAt,
+	}
+
+	// add to LRU list
+	p.lruMu.Lock()
+	ent.element = p.lruList.PushFront(ent)
+	p.lruMu.Unlock()
+
+	// add to storage
+	p.storage.Store(fullKey, ent)
+	atomic.AddInt32(&info.size, 1)
+	atomic.AddInt32(&p.size, 1)
+}
+
+// removeEntry removes an entry from storage
+func (p *Pool) removeEntry(ent *entry) {
+	p.storage.Delete(ent.key)
+
+	p.lruMu.Lock()
+	if ent.element != nil {
+		p.lruList.Remove(ent.element)
+		ent.element = nil
+	}
+	p.lruMu.Unlock()
+
+	p.cachesMu.RLock()
+	info := p.caches[ent.cacheName]
+	p.cachesMu.RUnlock()
+
+	if info != nil {
+		atomic.AddInt32(&info.size, -1)
+		atomic.AddInt64(&info.evictions, 1)
+	}
+	atomic.AddInt32(&p.size, -1)
+}
+
+// evictOne frees one slot using eviction policy
+// Returns true if an entry was evicted, false otherwise
+func (p *Pool) evictOne(requestingCache string) bool {
+	// 1. try to find and remove any expired entry
+	if p.evictExpired() {
+		return true
+	}
+
+	// 2. find cache with lowest priority above its min
+	p.cachesMu.RLock()
+	var victim *cacheInfo
+	for _, info := range p.caches {
+		if info.name == requestingCache {
+			continue
+		}
+		if int(atomic.LoadInt32(&info.size)) <= info.min {
+			continue
+		}
+		if victim == nil || info.priority < victim.priority {
+			victim = info
+		}
+	}
+	p.cachesMu.RUnlock()
+
+	if victim != nil {
+		return p.evictLRUFromCache(victim.name)
+	}
+
+	// 3. all other caches at min, evict from self
+	return p.evictFromCache(requestingCache)
+}
+
+// evictExpired finds and removes one expired entry
+func (p *Pool) evictExpired() bool {
+	p.lruMu.Lock()
+	var found *entry
+	for el := p.lruList.Back(); el != nil; el = el.Prev() {
+		ent, ok := el.Value.(*entry)
+		if !ok {
+			continue
+		}
+		if ent.isExpired() && !ent.isDeleted() {
+			found = ent
+			break
+		}
+	}
+	p.lruMu.Unlock()
+
+	if found != nil && found.markDeleted() {
+		p.removeEntry(found)
+		return true
+	}
+	return false
+}
+
+// evictFromCache evicts LRU entry from specific cache
+// Returns true if an entry was evicted, false otherwise
+func (p *Pool) evictFromCache(cacheName string) bool {
+	return p.evictLRUFromCache(cacheName)
+}
+
+// evictLRUFromCache removes the least recently used entry from a specific cache
+// Returns true if an entry was evicted, false otherwise
+func (p *Pool) evictLRUFromCache(cacheName string) bool {
+	p.lruMu.Lock()
+	var found *entry
+	for el := p.lruList.Back(); el != nil; el = el.Prev() {
+		ent, ok := el.Value.(*entry)
+		if !ok {
+			continue
+		}
+		if ent.cacheName == cacheName && !ent.isDeleted() {
+			found = ent
+			break
+		}
+	}
+	p.lruMu.Unlock()
+
+	if found != nil && found.markDeleted() {
+		p.removeEntry(found)
+		return true
+	}
+	return false
+}
+
 // makeKey creates unified storage key
 func makeKey(cacheName string, key any) string {
-	// Simple approach: use %v formatting
-	// For production might want something more efficient
 	return cacheName + ":" + toString(key)
 }
 
@@ -227,7 +497,6 @@ func toString(v any) string {
 	case int64:
 		return itoa64(val)
 	default:
-		// fallback for other comparable types
 		return fmt.Sprintf("%v", val)
 	}
 }
@@ -274,133 +543,4 @@ func itoa64(i int64) string {
 		b[pos] = '-'
 	}
 	return string(b[pos:])
-}
-
-// setInternal adds or updates entry (must be called with lock held)
-func (p *Pool) setInternal(cacheName string, key any, value any, ttl time.Duration) {
-	fullKey := makeKey(cacheName, key)
-	info := p.caches[cacheName]
-
-	// check if key already exists
-	if ent, exists := p.storage[fullKey]; exists {
-		// update existing
-		ent.value = value
-		ent.expiresAt = time.Now().Add(ttl)
-		p.lruList.MoveToFront(ent.element)
-		return
-	}
-
-	// need to add new entry
-	// first check if this cache is at max
-	if info.size >= info.max {
-		// must evict from self
-		p.evictFromCache(cacheName)
-	} else if p.usedSize() >= p.capacity {
-		// pool is full, need to evict
-		p.evictOne(cacheName)
-	}
-
-	// create new entry
-	ent := &entry{
-		key:       fullKey,
-		value:     value,
-		cacheName: cacheName,
-		expiresAt: time.Now().Add(ttl),
-	}
-	ent.element = p.lruList.PushFront(ent)
-	p.storage[fullKey] = ent
-	info.size++
-}
-
-// usedSize returns total number of entries across all caches
-func (p *Pool) usedSize() int {
-	total := 0
-	for _, info := range p.caches {
-		total += info.size
-	}
-	return total
-}
-
-// removeEntry removes an entry from storage (must be called with lock held)
-func (p *Pool) removeEntry(ent *entry) {
-	delete(p.storage, ent.key)
-	p.lruList.Remove(ent.element)
-	if info, ok := p.caches[ent.cacheName]; ok {
-		info.size--
-	}
-}
-
-// evictOne frees one slot using eviction policy
-// priority: 1) expired anywhere 2) LRU from lowest priority cache above min 3) LRU from self
-func (p *Pool) evictOne(requestingCache string) {
-	// 1. try to find and remove any expired entry
-	if p.evictExpired() {
-		return
-	}
-
-	// 2. find cache with lowest priority that is above its min
-	// (excluding requesting cache for now)
-	var victim *cacheInfo
-	for _, info := range p.caches {
-		if info.name == requestingCache {
-			continue
-		}
-		if info.size <= info.min {
-			continue
-		}
-		if victim == nil || info.priority < victim.priority {
-			victim = info
-		}
-	}
-
-	if victim != nil {
-		p.evictLRUFromCache(victim.name)
-		return
-	}
-
-	// 3. all other caches at min, evict from self
-	p.evictFromCache(requestingCache)
-}
-
-// evictExpired finds and removes one expired entry
-func (p *Pool) evictExpired() bool {
-	now := time.Now()
-	// iterate from back (LRU end) to find expired
-	for el := p.lruList.Back(); el != nil; el = el.Prev() {
-		ent, ok := el.Value.(*entry)
-		if !ok {
-			continue
-		}
-		if now.After(ent.expiresAt) {
-			p.removeEntry(ent)
-			if info, ok := p.caches[ent.cacheName]; ok {
-				info.evictions++
-			}
-			return true
-		}
-	}
-	return false
-}
-
-// evictFromCache evicts LRU entry from specific cache
-func (p *Pool) evictFromCache(cacheName string) {
-	p.evictLRUFromCache(cacheName)
-}
-
-// evictLRUFromCache removes the least recently used entry from a specific cache
-func (p *Pool) evictLRUFromCache(cacheName string) {
-	// find LRU entry belonging to this cache
-	for el := p.lruList.Back(); el != nil; el = el.Prev() {
-		ent, ok := el.Value.(*entry)
-		if !ok {
-			continue
-		}
-		if ent.cacheName == cacheName {
-			p.removeEntry(ent)
-			if info, ok := p.caches[cacheName]; ok {
-				info.evictions++
-			}
-			return
-		}
-	}
 }
